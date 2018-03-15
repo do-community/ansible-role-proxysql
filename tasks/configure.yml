@@ -1,0 +1,172 @@
+---
+- name: Copy SSL information to the proxy host
+  copy:
+    dest: "/etc/proxysql-{{ item.item }}"
+    content: "{{ item.content | b64decode }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  with_items: "{{ hostvars[proxysql_mysql_backend_servers[0]].pki_certs.results }}"
+  when:
+    - proxysql_require_ssl
+    - (item.item == "ca.pem") or (item.item == "client-cert.pem") or (item.item == "client-key.pem")
+
+- name: Generate configuration template and copy to host
+  template:
+    src: proxysql.cnf.j2
+    dest: /etc/proxysql.cnf
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: config_status
+  become: true
+
+- name: Generate MySQL client config files
+  template:
+    src: my.cnf.j2
+    dest: "~/{{ item.filename }}"
+    owner: "{{ ansible_user_id }}"
+    group: "{{ ansible_user_id }}"
+    mode: "0600"
+  no_log: true
+  with_items: "{{ proxysql_user_data }}"
+
+- name: Ensure ProxySQL service started
+  service:
+    name: proxysql
+    state: started
+    enabled: true
+  become: true
+
+- block:
+
+  - name: Manage admin config
+    proxysql_global_variables:
+      config_file: "~/.my.cnf"
+      variable: "admin-{{ item.value.variable }}"
+      value: "{{ item.value.variable_value }}"
+      save_to_disk: false
+      load_to_runtime: false
+    with_dict: "{{ proxysql_admin_variables }}"
+
+  - name: Manage MySQL config
+    proxysql_global_variables:
+      config_file: "~/.my.cnf"
+      variable: "mysql-{{ item.value.variable }}"
+      value: "{{ item.value.variable_value }}"
+      save_to_disk: false
+      load_to_runtime: false
+    with_dict: "{{ proxysql_mysql_variables }}"
+
+  - name: Flush global variables to disk and load to runtime
+    proxysql_manage_config:
+      config_file: "~/.my.cnf"
+      action: "{{ item[1].action }}"
+      config_settings: "{{ item[0] }}"
+      direction: "{{ item[1].direction }}"
+      config_layer: "{{ item[1].config_layer }}"
+    with_nested:
+      - ['ADMIN VARIABLES', 'MYSQL VARIABLES']
+      - - action: SAVE
+          direction: TO
+          config_layer: DISK
+        - action: LOAD
+          direction: FROM
+          config_layer: MEMORY
+
+  when: config_status.changed
+
+  # The Ansible ProxySQL modules don't currently understand group replication
+  # hostgroups, so we need to do this manually for the time being.
+- name: Check group replication hostgroups
+  shell: > 
+      mysql -Nnrse "select printf('%d,%d,%d,%d,%d,%d,%d,%d',
+      {{ proxysql_GR_hostgroups | map(attribute='variable') | join(',') }})
+      from mysql_group_replication_hostgroups"
+  changed_when: false
+  register: GR_hostgroups_query
+
+- name: Add group replication hostgroups
+  shell: >
+      mysql -Nnrse "INSERT OR REPLACE INTO mysql_group_replication_hostgroups
+      ({{ proxysql_GR_hostgroups | map(attribute='variable') | join(',') }}) 
+      VALUES ({{ proxysql_GR_hostgroups | map(attribute='value') | join(',') }});"
+  register: GR_hostgroups
+  when: GR_hostgroups_query.stdout != (proxysql_GR_hostgroups | map(attribute='value') | join(','))
+
+- name: Add servers to the writer hostgroup
+  proxysql_backend_servers:
+    config_file: "~/.my.cnf"
+    hostgroup_id: "{{ proxysql_GR_hostgroups_writer_hostgroup }}"
+    hostname: "{{ hostvars[item]['ansible_eth1']['ipv4']['address'] if proxysql_private_networking else hostvars[item]['ansible_eth0']['ipv4']['address'] }}"
+    port: 3306
+    use_ssl: "{{ 1 if proxysql_require_ssl else 0 }}"
+    state: present
+    load_to_runtime: false
+  with_items: "{{ proxysql_mysql_backend_servers }}"
+  when: hostvars[item]['primary'] is defined
+
+- name: Add servers to the reader hostgroup
+  proxysql_backend_servers:
+    config_file: "~/.my.cnf"
+    hostgroup_id: "{{ proxysql_GR_hostgroups_reader_hostgroup }}"
+    hostname: "{{ hostvars[item]['ansible_eth1']['ipv4']['address'] if proxysql_private_networking else hostvars[item]['ansible_eth0']['ipv4']['address'] }}"
+    port: 3306
+    use_ssl: "{{ 1 if proxysql_require_ssl else 0 }}"
+    state: present
+    load_to_runtime: false
+  with_items: "{{ proxysql_mysql_backend_servers }}"
+  when: hostvars[item]['primary'] is not defined
+
+- name: Add MySQL users
+  proxysql_mysql_users:
+    config_file: "~/.my.cnf"
+    username: "{{ item.user }}"
+    password: "{{ item.password }}"
+    default_hostgroup: "{{ item.default_hostgroup | default(proxysql_GR_hostgroups_writer_hostgroup) }}"
+    state: present
+    load_to_runtime: false
+  no_log: true
+  register: mysql_users
+  with_items: "{{ proxysql_user_data }}"
+  when: item.user != 'admin'
+
+- name: Add query rules
+  proxysql_query_rules:
+    config_file: "~/.my.cnf"
+    match_pattern: "^SELECT"
+    destination_hostgroup: "{{ proxysql_GR_hostgroups_reader_hostgroup }}"
+    active: true
+    apply: true
+    state: present
+    load_to_runtime: false
+  register: mysql_query_rules
+
+- name: Apply replication hostgroups
+  proxysql_manage_config:
+    config_file: "~/.my.cnf"
+    action: LOAD
+    config_settings: MYSQL SERVERS
+    direction: TO
+    config_layer: RUNTIME
+  when: GR_hostgroups.changed
+
+- name: Apply MySQL users
+  proxysql_manage_config:
+    config_file: "~/.my.cnf"
+    action: LOAD
+    config_settings: MYSQL USERS
+    direction: TO
+    config_layer: RUNTIME
+  when: mysql_users.changed
+
+- name: Apply query rules
+  proxysql_manage_config:
+    config_file: "~/.my.cnf"
+    action: LOAD
+    config_settings: MYSQL QUERY RULES
+    direction: TO
+    config_layer: RUNTIME
+  when: mysql_query_rules.changed

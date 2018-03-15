@@ -1,0 +1,7 @@
+---
+# handlers file for proxysql
+- name: Restart ProxySQL
+  service:
+    name: proxysql
+    state: restarted
+  become: true

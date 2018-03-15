@@ -1,0 +1,19 @@
+#file proxysql.cfg
+
+# {{ ansible_managed }}
+
+datadir="{{ proxysql_datadir }}"
+
+admin_variables=
+{
+{% for config_item in proxysql_admin_variables | dictsort(false, 'value') %}
+	{{ config_item[1].variable }}={{ ("" if config_item[1].variable_value == none else config_item[1].variable_value) | to_json }}
+{% endfor %}
+}
+
+mysql_variables=
+{
+{% for config_item in proxysql_mysql_variables | dictsort(false, 'value') %}
+	{{ config_item[1].variable }}={{ ("" if config_item[1].variable_value == none else config_item[1].variable_value) | to_json }}
+{% endfor %}
+}

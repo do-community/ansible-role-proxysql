@@ -1,0 +1,9 @@
+# {{ ansible_managed }}
+[client]
+user={{ item.user }}
+password={{ item.password }}
+port={{ item.port }}
+host=127.0.0.1
+
+[mysql]
+prompt="{{ item.prompt }}"
